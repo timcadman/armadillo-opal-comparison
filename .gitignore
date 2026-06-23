@@ -1,0 +1,6 @@
+results/
+*.csv
+secrets.env
+.Rproj.user/
+.Rhistory
+.RData
