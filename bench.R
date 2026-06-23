@@ -45,16 +45,30 @@ ds_ops <- function(be) {
   cn <- conns[[be]]
   list(
     datashield.assign.table = function() datashield.assign.table(cn, "scratch", table_a_ref(be)),
-    ds.subset = function() ds.subset(x = "D", subset = "sub", cols = c("id", "num1", "num2"), datasources = cn),
+    ds.dataFrameSubset_row = function() ds.dataFrameSubset(df.name = "D", V1.name = "D$num1", V2.name = "D$num4", Boolean.operator = ">", newobj = "sub_row", datasources = cn),
+    ds.dataFrameSubset_col = function() ds.dataFrameSubset(df.name = "D", V1.name = "D$num1", V2.name = "D$num1", Boolean.operator = ">=", keep.cols = c(1, 2, 3), newobj = "sub_col", datasources = cn),
     ds.Boole  = function() ds.Boole(V1 = "D$num1", V2 = "0", Boolean.operator = ">", newobj = "bo", datasources = cn),
     ds.assign = function() ds.assign(toAssign = "D$num1*2", newobj = "ao", datasources = cn),
     ds.mean   = function() ds.mean(x = "D$num1", datasources = cn),
     ds.table  = function() ds.table(rvar = "D$fac1", cvar = "D$fac2", datasources = cn),
     ds.glm    = function() ds.glm(formula = "bin_outcome ~ num1 + int1", data = "D", family = "binomial", datasources = cn),
     ds.glmSLMA = function() ds.glmSLMA(formula = "bin_outcome ~ num1 + int1", family = "binomial", dataName = "D", datasources = cn),
-    ds.merge  = function() ds.merge(x.name = "D", y.name = "D2", by.x.names = "id", by.y.names = "id", newobj = "mg", datasources = cn)
+    ds.merge  = function() ds.merge(x.name = "D", y.name = "D2", by.x.names = "key", by.y.names = "key", newobj = "mg", datasources = cn)
   )
 }
+
+# Server-side object each op leaves behind (ops not listed are aggregates that
+# create nothing). Removed between cells so the persistent session doesn't
+# accumulate large objects over the run. NA => nothing to clear.
+NEWOBJ <- c(
+  datashield.assign.table = "scratch",
+  ds.dataFrameSubset_row  = "sub_row",
+  ds.dataFrameSubset_col  = "sub_col",
+  ds.Boole                = "bo",
+  ds.assign               = "ao",
+  ds.glmSLMA              = "new.glm.obj",
+  ds.merge                = "mg"
+)
 
 # --- Session timing (login / logout / workspace_load) -----------------------
 # Uses throwaway connections so it doesn't disturb the persistent ones. Login
@@ -100,6 +114,8 @@ for (rep in seq_len(REPS)) {
         be_ <- be; fn_ <- fn; rep_ <- rep; op_ <- ops[[fn]]
         add(function() {
           r <- time_op(op_, DURATION_SEC)
+          obj <- unname(NEWOBJ[fn_])   # NA if this op leaves no server object
+          if (!is.na(obj)) try(ds.rm(x.names = obj, datasources = conns[[be_]]), silent = TRUE)
           data.frame(backend = be_, op = fn_, rep = rep_, r)
         })
       })
@@ -116,9 +132,21 @@ cat(sprintf("Running %d cells (%g s each)...\n", length(cells), DURATION_SEC))
 
 results <- list()
 for (i in seq_along(ord)) {
-  res <- tryCatch(cells[[ord[i]]](), error = function(e) {
-    message(sprintf("  cell %d failed: %s", i, conditionMessage(e))); NULL
-  })
+  warns <- character(0)
+  res <- withCallingHandlers(
+    tryCatch(cells[[ord[i]]](), error = function(e) {
+      message(sprintf("  cell %d failed: %s", i, conditionMessage(e))); NULL
+    }),
+    warning = function(w) {
+      warns[[length(warns) + 1L]] <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    }
+  )
+  if (length(warns)) {
+    counts <- table(warns)
+    for (msg in names(counts))
+      message(sprintf("  cell %d warning (x%d): %s", i, counts[[msg]], msg))
+  }
   if (!is.null(res)) results[[length(results) + 1]] <- res
   cat(sprintf("[%d/%d]\n", i, length(cells)))
 }

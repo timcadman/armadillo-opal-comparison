@@ -18,12 +18,15 @@ suppressMessages({
 force <- nzchar(Sys.getenv("FORCE"))
 
 # --- 1. Synthetic data ------------------------------------------------------
-# tableA: `id` (entity identifier) + 9 mixed-type variables = 10 columns.
-# tableB: `id` + 3 variables, sharing `id` so ds.merge has a join key.
+# tableA: `id` (entity identifier) + `key` (join key) + 9 mixed-type variables.
+# tableB: `id` + `key` + 3 variables. `key` is a normal column on BOTH backends
+# (Opal hides the `id` identifier from the assigned data frame), so ds.subset and
+# ds.merge can reference / join on it identically on Opal and Armadillo.
 set.seed(42)
 make_tables <- function(n) {
   a <- data.frame(
     id          = seq_len(n),
+    key         = seq_len(n),
     num1        = rnorm(n),
     num2        = rnorm(n, mean = 10, sd = 3),
     num3        = runif(n),
@@ -36,6 +39,7 @@ make_tables <- function(n) {
   )
   b <- data.frame(
     id = seq_len(n),
+    key = seq_len(n),
     b1 = rnorm(n),
     b2 = factor(sample(letters[1:4], n, replace = TRUE)),
     b3 = runif(n, 0, 100)
@@ -81,9 +85,11 @@ upload_arma <- function(a, b) {
   }
   existing <- tryCatch(armadillo.list_tables(PROJECT), error = function(e) character(0))
   save_one <- function(df, tbl) {
-    if (!force && any(grepl(paste0(FOLDER, "/", tbl, "$"), existing))) {
+    exists_tbl <- any(grepl(paste0(FOLDER, "/", tbl, "$"), existing))
+    if (exists_tbl && !force) {
       cat(sprintf("skip (exists): %s/%s/%s\n", PROJECT, FOLDER, tbl)); return(invisible())
     }
+    if (exists_tbl) armadillo.delete_table(PROJECT, FOLDER, tbl)   # force: overwrite
     armadillo.upload_table(PROJECT, FOLDER, df, tbl)
     cat(sprintf("uploaded: %s/%s/%s\n", PROJECT, FOLDER, tbl))
   }
