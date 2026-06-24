@@ -5,6 +5,39 @@
 # change the URLs / credentials below. Everything else is derived.
 # ==============================================================================
 
+# Run against the CRAN (Obiba) release of dsBaseClient from a project-local
+# library, not whatever dev build is installed globally. Install once with:
+#   install.packages("dsBaseClient", lib = ".Rlib",
+#                    repos = "https://cran.obiba.org", dependencies = FALSE)
+# (dependencies resolve from the system library). Override the path with BENCH_LIB.
+# Optional: load credentials/URL from an env file (ENV_FILE=path), e.g. for a
+# remote server. Parsed in R (no shell evaluation, values literal incl. special
+# chars, never echoed); inline ' # comments' are stripped. Only active when set,
+# so localhost runs are unaffected.
+if (nzchar(Sys.getenv("ENV_FILE"))) local({
+  for (ln in readLines(Sys.getenv("ENV_FILE"), warn = FALSE)) {
+    if (grepl("^\\s*#", ln) || !grepl("=", ln)) next
+    k <- trimws(sub("=.*$", "", ln))
+    v <- trimws(sub("\\s+#.*$", "", sub("^[^=]*=", "", ln)))
+    if (nzchar(k)) do.call(Sys.setenv, setNames(list(v), k))
+  }
+})
+
+LOCAL_LIB <- Sys.getenv("BENCH_LIB", ".Rlib")
+# BENCH_LIB may be a comma-separated list of libraries (first = highest priority),
+# e.g. a patched-package lib followed by .Rlib. Existing dirs are prepended in order.
+LOCAL_LIBS <- trimws(strsplit(LOCAL_LIB, ",")[[1]])
+LOCAL_LIBS <- LOCAL_LIBS[dir.exists(LOCAL_LIBS)]
+if (length(LOCAL_LIBS) > 0) {
+  .libPaths(c(normalizePath(LOCAL_LIBS), .libPaths()))
+} else {
+  warning(sprintf(paste0("Project library '%s' not found - using the globally ",
+    "installed dsBaseClient, whose version may not match the CRAN release this ",
+    "benchmark targets. Install it with:\n  install.packages('dsBaseClient', ",
+    "lib='%s', repos='https://cran.obiba.org', dependencies=FALSE)"),
+    LOCAL_LIB, LOCAL_LIB), call. = FALSE)
+}
+
 suppressMessages({
   library(DSI)
   library(DSOpal)
@@ -15,6 +48,10 @@ suppressMessages({
 OPAL_URL  <- Sys.getenv("OPAL_URL",  "http://localhost:8080")
 OPAL_USER <- Sys.getenv("OPAL_USER", "administrator")
 OPAL_PASS <- Sys.getenv("OPAL_PASS", "datashield_test&")
+# Path to Opal's docker compose file. If set, bench.R auto-restarts Opal (which
+# crashes intermittently) when its connection drops mid-run, so long unattended
+# runs survive. Leave blank to disable auto-restart (reconnect-only).
+OPAL_COMPOSE <- Sys.getenv("OPAL_COMPOSE", "")
 
 # --- Armadillo --------------------------------------------------------------
 # Auth is token-based by default: if ARMA_TOKEN is unset, arma_token() fetches one
@@ -31,17 +68,57 @@ ARMA_PROFILE        <- Sys.getenv("ARMA_PROFILE",        "default")
 ARMA_RSERVE_PROFILE <- Sys.getenv("ARMA_RSERVE_PROFILE", "rserve")
 
 # --- Data -------------------------------------------------------------------
+# Benchmark data is REAL dsBaseClient test data, loaded from the package's
+# tests/testthat/data_files and inflated to N_ROWS x ~N_VARS in setup.R. Each
+# dataset becomes a table on both backends and is assigned to a fixed server
+# symbol that the benchmark calls reference (D = CNSIM, DS = survival, etc.).
+DATA_DIR <- Sys.getenv("DSBASECLIENT_DATA",
+  file.path(Sys.getenv("HOME"), "git-repos/ds-core/dsBaseClient/tests/testthat/data_files"))
+
 PROJECT <- "perf"
 FOLDER  <- "bench"          # Armadillo folder (Opal has no folders)
-TABLE_A <- "tableA"
-TABLE_B <- "tableB"
 N_ROWS  <- as.integer(Sys.getenv("N_ROWS", "100000"))
+N_VARS  <- as.integer(Sys.getenv("N_VARS", "30"))   # target columns per table
 
-# How each backend names a table reference passed to datashield.assign.table().
-OPAL_TABLE_A <- paste0(PROJECT, ".", TABLE_A)
-OPAL_TABLE_B <- paste0(PROJECT, ".", TABLE_B)
-ARMA_TABLE_A <- paste(PROJECT, FOLDER, TABLE_A, sep = "/")
-ARMA_TABLE_B <- paste(PROJECT, FOLDER, TABLE_B, sep = "/")
+# How a table name maps to a per-backend reference for datashield.assign.table().
+ds_table_ref <- function(be, tbl)
+  if (be == "opal") paste0(PROJECT, ".", tbl) else paste(PROJECT, FOLDER, tbl, sep = "/")
+
+# Dataset registry (source of truth for setup.R upload + bench.R assigns):
+#   rda     - path under DATA_DIR of the dsBaseClient .rda to load
+#   table   - uploaded table name (same on both backends)
+#   symbol  - server-side object the benchmark assigns the table to
+#   kind    - row inflation strategy: "flat" samples rows with replacement;
+#             "survival"/"cluster" tile + re-number id_cols so subject/grouping
+#             identifiers stay valid and unique
+#   id_cols - identifier columns re-numbered per tile (structured kinds)
+#   slim    - keep only id/key + a few columns (the merge partner table)
+DATASETS <- list(
+  cnsim    = list(rda = "CNSIM/CNSIM1.rda", table = "CNSIM",   symbol = "D",  kind = "flat"),
+  cnsim_b  = list(rda = "CNSIM/CNSIM1.rda", table = "CNSIM_B", symbol = "D2", kind = "flat", slim = TRUE),
+  survival = list(rda = "SURVIVAL/EXPAND_NO_MISSING/EXPAND_NO_MISSING1.rda",
+                  table = "SURVIVAL", symbol = "DS", kind = "survival", id_cols = c("id")),
+  cluster  = list(rda = "CLUSTER/CLUSTER_SLO1.rda", table = "CLUSTER", symbol = "DC",
+                  kind = "cluster", id_cols = c("idSurgery", "idDoctor")),
+  gamlss   = list(rda = "GAMLSS/gamlss1.rda", table = "GAMLSS", symbol = "DG", kind = "flat"),
+  anthro   = list(rda = "ANTHRO/anthro1.rda", table = "ANTHRO", symbol = "DA", kind = "flat")
+)
+
+# Restrict the active datasets via env (comma-separated keys), e.g. BENCH_DATASETS=cnsim
+# to upload/assign only CNSIM. Lets a run (esp. remote) work off a single table.
+.use_ds <- trimws(strsplit(Sys.getenv("BENCH_DATASETS", ""), ",")[[1]])
+.use_ds <- .use_ds[nzchar(.use_ds)]
+if (length(.use_ds) > 0) DATASETS <- DATASETS[.use_ds]
+
+# Back-compat refs used by build_logins() (default login table) and the
+# workspace save in setup.R. CNSIM is the default; the benchmark assigns every
+# dataset explicitly regardless.
+TABLE_A <- DATASETS$cnsim$table
+TABLE_B <- DATASETS$cnsim_b$table
+OPAL_TABLE_A <- ds_table_ref("opal", TABLE_A)
+OPAL_TABLE_B <- ds_table_ref("opal", TABLE_B)
+ARMA_TABLE_A <- ds_table_ref("armadillo", TABLE_A)
+ARMA_TABLE_B <- ds_table_ref("armadillo", TABLE_B)
 
 # --- Benchmark settings -----------------------------------------------------
 DURATION_SEC <- as.numeric(Sys.getenv("DURATION_SEC", "20"))  # seconds per cell
@@ -49,8 +126,15 @@ REPS         <- as.integer(Sys.getenv("REPS", "10"))          # repeats per cell
 SEED         <- as.integer(Sys.getenv("SEED", "1"))           # shuffle seed
 WORKSPACE    <- "perf_ws"                                     # saved in setup.R
 
-BACKENDS  <- c("opal", "armadillo", "armadillo_rserve")
-OUT_CSV   <- file.path("results", "rates.csv")
+# BACKENDS / output path / poll floor are env-overridable so one run can target a
+# subset of backends, write to a separate CSV, and use a non-default DSI poll-sleep.
+BACKENDS  <- trimws(strsplit(Sys.getenv("BACKENDS", "opal,armadillo,armadillo_rserve"), ",")[[1]])
+OUT_CSV   <- Sys.getenv("OUT_CSV", file.path("results", "rates.csv"))
+
+# DSI client poll-sleep floor (seconds). Default 50ms; lower it to reduce the
+# client-side wait between "is it done?" checks (helps poll-dominated ops).
+poll0 <- Sys.getenv("POLL_SLEEP0", "")
+if (nzchar(poll0)) options(datashield.polling.sleep.0 = as.numeric(poll0))
 
 # --- Per-backend helpers ----------------------------------------------------
 table_a_ref <- function(be) if (be == "opal") OPAL_TABLE_A else ARMA_TABLE_A

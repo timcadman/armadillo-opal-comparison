@@ -14,8 +14,16 @@
 set -euo pipefail
 
 # --- Paths (override via env if your layout differs) ------------------------
-OPAL_COMPOSE_DIR="${OPAL_COMPOSE_DIR:-/Users/tcadman/Library/CloudStorage/GoogleDrive-timcadman@gmail.com/Mi unidad/Work/repos/testing/opal-localhost}"
-ARMADILLO_DIR="${ARMADILLO_DIR:-/Users/tcadman/git-repos/ds-molgenis/molgenis-service-armadillo}"
+# Defaults are $HOME-relative so the script is portable across machines/users;
+# the Armadillo checkout is auto-detected among common locations.
+OPAL_COMPOSE_DIR="${OPAL_COMPOSE_DIR:-$HOME/Library/CloudStorage/GoogleDrive-timcadman@gmail.com/Mi unidad/Work/repos/testing/opal-localhost}"
+if [ -z "${ARMADILLO_DIR:-}" ]; then
+  for d in "$HOME/git-repos/molgenis/molgenis-service-armadillo" \
+           "$HOME/git-repos/ds-molgenis/molgenis-service-armadillo"; do
+    [ -d "$d" ] && ARMADILLO_DIR="$d" && break
+  done
+  ARMADILLO_DIR="${ARMADILLO_DIR:-$HOME/git-repos/molgenis/molgenis-service-armadillo}"
+fi
 ARMA_PORT="${ARMA_PORT:-8081}"
 
 wait_for() {  # name url
@@ -33,13 +41,16 @@ echo "== Starting Opal =="
 docker compose -f "$OPAL_COMPOSE_DIR/docker-compose.yml" up -d
 
 # --- Armadillo --------------------------------------------------------------
+# Logs/pid go to $LOG_DIR (defaults to $TMPDIR, falling back to /tmp) so the
+# script works under restricted-/tmp sandboxes too.
+LOG_DIR="${ARMA_LOG_DIR:-${TMPDIR:-/tmp}}"
 echo "== Starting Armadillo on port $ARMA_PORT =="
 (
   cd "$ARMADILLO_DIR"
-  SERVER_PORT="$ARMA_PORT" ./gradlew run > "/tmp/armadillo-$ARMA_PORT.log" 2>&1 &
-  echo "$!" > "/tmp/armadillo-$ARMA_PORT.pid"
+  SERVER_PORT="$ARMA_PORT" ./gradlew run > "$LOG_DIR/armadillo-$ARMA_PORT.log" 2>&1 &
+  echo "$!" > "$LOG_DIR/armadillo-$ARMA_PORT.pid"
 )
-echo "Armadillo PID: $(cat "/tmp/armadillo-$ARMA_PORT.pid")  (log: /tmp/armadillo-$ARMA_PORT.log)"
+echo "Armadillo PID: $(cat "$LOG_DIR/armadillo-$ARMA_PORT.pid")  (log: $LOG_DIR/armadillo-$ARMA_PORT.log)"
 
 # --- Readiness --------------------------------------------------------------
 wait_for "Opal"      "http://localhost:8080"
@@ -58,5 +69,5 @@ Next:
 
 Stop:
   docker compose -f "$OPAL_COMPOSE_DIR/docker-compose.yml" down
-  kill \$(cat /tmp/armadillo-$ARMA_PORT.pid)
+  kill \$(cat $LOG_DIR/armadillo-$ARMA_PORT.pid)
 EOF

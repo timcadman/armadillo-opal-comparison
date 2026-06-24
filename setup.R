@@ -1,8 +1,14 @@
 # ==============================================================================
-# One-time setup: generate synthetic data, upload it to BOTH backends, and save
-# a DataSHIELD workspace on each (so the benchmark can time workspace loading).
+# One-time setup: build the benchmark tables from REAL dsBaseClient test data,
+# upload them to BOTH backends, and save a DataSHIELD workspace on each (so the
+# benchmark can time workspace loading).
 #
 #   Rscript setup.R
+#
+# Data comes from the dsBaseClient package's tests/testthat/data_files (see
+# DATA_DIR / DATASETS in config.R). Each dataset is loaded from its .rda and
+# inflated to N_ROWS rows x ~N_VARS columns, mirroring the datasets the
+# dsBaseClient tests use for each function.
 #
 # Requires both servers running (see start_servers.sh). Idempotent: tables and
 # workspaces that already exist are left alone (set FORCE=1 to overwrite tables).
@@ -16,42 +22,89 @@ suppressMessages({
 })
 
 force <- nzchar(Sys.getenv("FORCE"))
-
-# --- 1. Synthetic data ------------------------------------------------------
-# tableA: `id` (entity identifier) + `key` (join key) + 9 mixed-type variables.
-# tableB: `id` + `key` + 3 variables. `key` is a normal column on BOTH backends
-# (Opal hides the `id` identifier from the assigned data frame), so ds.subset and
-# ds.merge can reference / join on it identically on Opal and Armadillo.
 set.seed(42)
-make_tables <- function(n) {
-  a <- data.frame(
-    id          = seq_len(n),
-    key         = seq_len(n),
-    num1        = rnorm(n),
-    num2        = rnorm(n, mean = 10, sd = 3),
-    num3        = runif(n),
-    num4        = rnorm(n, mean = -5, sd = 2),
-    int1        = sample(1:100, n, replace = TRUE),
-    int2        = sample(1:5,   n, replace = TRUE),
-    fac1        = factor(sample(c("a", "b", "c"), n, replace = TRUE)),
-    fac2        = factor(sample(c("x", "y"),      n, replace = TRUE)),
-    bin_outcome = sample(0:1, n, replace = TRUE)
-  )
-  b <- data.frame(
-    id = seq_len(n),
-    key = seq_len(n),
-    b1 = rnorm(n),
-    b2 = factor(sample(letters[1:4], n, replace = TRUE)),
-    b3 = runif(n, 0, 100)
-  )
-  list(a = a, b = b)
+
+# --- 1. Build tables from dsBaseClient data ---------------------------------
+# Load the object stored in a dsBaseClient .rda (the object name varies, e.g.
+# "study1"), returning the data frame.
+load_rda <- function(rel) {
+  e  <- new.env()
+  nm <- load(file.path(DATA_DIR, rel), envir = e)
+  e[[nm]]
 }
 
-cat(sprintf("Generating synthetic data (%d rows)...\n", N_ROWS))
-dat <- make_tables(N_ROWS)
+# Append synthetic columns (numeric / integer / factor in rotation) until the
+# frame has `n_vars` columns. Deterministic under the seed set above.
+pad_to <- function(df, n_vars) {
+  need <- n_vars - ncol(df)
+  if (need <= 0) return(df)
+  n <- nrow(df)
+  extra <- lapply(seq_len(need), function(i) {
+    switch((i - 1) %% 3 + 1,
+           rnorm(n),
+           sample.int(100, n, replace = TRUE),
+           factor(sample(c("a", "b", "c"), n, replace = TRUE)))
+  })
+  names(extra) <- paste0("x", seq_len(need))
+  cbind(df, as.data.frame(extra, stringsAsFactors = FALSE))
+}
+
+# Flat datasets (CNSIM, GAMLSS, ...): upsample rows with replacement to n,
+# preserving distributions / factor levels / NAs. Prepend a unique Opal entity
+# id (`entity_id`, hidden by Opal from the assigned frame) and a `key` join
+# column for ds.merge, then pad to ~N_VARS.
+inflate_flat <- function(df, n, n_vars) {
+  out <- df[sample.int(nrow(df), n, replace = TRUE), , drop = FALSE]
+  rownames(out) <- NULL
+  out <- cbind(entity_id = seq_len(n), key = seq_len(n), out)
+  pad_to(out, n_vars)
+}
+
+# Structured datasets (survival subjects, clustered patients/doctors): tile the
+# frame to >= n rows and offset id_cols per tile so identifiers stay unique
+# (survival) and groups scale up but stay valid (cluster). Add the unique Opal
+# entity id, then pad. Native id columns (e.g. survival `id`) are kept visible.
+inflate_struct <- function(df, n, id_cols, n_vars) {
+  reps  <- ceiling(n / nrow(df))
+  parts <- lapply(seq_len(reps), function(k) {
+    p <- df
+    for (cl in id_cols) {
+      if (!cl %in% names(p)) next
+      v <- p[[cl]]
+      # numeric ids: offset per tile to stay unique; factor/character grouping
+      # ids: suffix the tile index so groups multiply but remain distinct.
+      p[[cl]] <- if (is.numeric(v)) v + (k - 1L) * (max(df[[cl]], na.rm = TRUE) + 1L)
+                 else factor(paste0(as.character(v), "_t", k))
+    }
+    p
+  })
+  out <- do.call(rbind, parts)[seq_len(n), , drop = FALSE]
+  rownames(out) <- NULL
+  out <- cbind(entity_id = seq_len(n), out)
+  pad_to(out, n_vars)
+}
+
+build_tables <- function(n) {
+  tabs <- list()
+  for (d in DATASETS) {
+    raw <- load_rda(d$rda)
+    tab <- if (d$kind == "flat") inflate_flat(raw, n, N_VARS)
+           else                  inflate_struct(raw, n, d$id_cols, N_VARS)
+    if (isTRUE(d$slim))
+      tab <- tab[, c("entity_id", "key", "LAB_TRIG", "GENDER", "LAB_HDL")]
+    tabs[[d$table]] <- tab
+  }
+  tabs
+}
+
+cat(sprintf("Building %d benchmark tables from dsBaseClient data (%d rows)...\n",
+            length(DATASETS), N_ROWS))
+tables <- build_tables(N_ROWS)
+for (nm in names(tables))
+  cat(sprintf("  %-10s %d x %d\n", nm, nrow(tables[[nm]]), ncol(tables[[nm]])))
 
 # --- 2. Upload to Opal ------------------------------------------------------
-upload_opal <- function(a, b) {
+upload_opal <- function(tables) {
   cat("\n== Opal ==\n")
   o <- opal.login(OPAL_USER, OPAL_PASS, url = OPAL_URL)
   on.exit(opal.logout(o), add = TRUE)
@@ -64,19 +117,18 @@ upload_opal <- function(a, b) {
     opal.project_create(o, PROJECT, database = db)
   }
 
-  save_one <- function(df, tbl) {
+  for (tbl in names(tables)) {
     if (!force && opal.table_exists(o, PROJECT, tbl)) {
-      cat(sprintf("skip (exists): %s.%s\n", PROJECT, tbl)); return(invisible())
+      cat(sprintf("skip (exists): %s.%s\n", PROJECT, tbl)); next
     }
-    opal.table_save(o, as_tibble(df), PROJECT, tbl, overwrite = TRUE, force = TRUE, id.name = "id")
+    opal.table_save(o, as_tibble(tables[[tbl]]), PROJECT, tbl,
+                    overwrite = TRUE, force = TRUE, id.name = "entity_id")
     cat(sprintf("uploaded: %s.%s\n", PROJECT, tbl))
   }
-  save_one(a, TABLE_A)
-  save_one(b, TABLE_B)
 }
 
 # --- 3. Upload to Armadillo -------------------------------------------------
-upload_arma <- function(a, b) {
+upload_arma <- function(tables) {
   cat("\n== Armadillo ==\n")
   armadillo.login_basic(ARMA_URL, ARMA_USER, ARMA_PASS)
   if (!(PROJECT %in% armadillo.list_projects())) {
@@ -84,25 +136,31 @@ upload_arma <- function(a, b) {
     armadillo.create_project(PROJECT)
   }
   existing <- tryCatch(armadillo.list_tables(PROJECT), error = function(e) character(0))
-  save_one <- function(df, tbl) {
+  for (tbl in names(tables)) {
     exists_tbl <- any(grepl(paste0(FOLDER, "/", tbl, "$"), existing))
     if (exists_tbl && !force) {
-      cat(sprintf("skip (exists): %s/%s/%s\n", PROJECT, FOLDER, tbl)); return(invisible())
+      cat(sprintf("skip (exists): %s/%s/%s\n", PROJECT, FOLDER, tbl)); next
     }
     if (exists_tbl) armadillo.delete_table(PROJECT, FOLDER, tbl)   # force: overwrite
-    armadillo.upload_table(PROJECT, FOLDER, df, tbl)
+    armadillo.upload_table(PROJECT, FOLDER, tables[[tbl]], tbl)
     cat(sprintf("uploaded: %s/%s/%s\n", PROJECT, FOLDER, tbl))
   }
-  save_one(a, TABLE_A)
-  save_one(b, TABLE_B)
 }
 
-upload_opal(dat$a, dat$b)
-upload_arma(dat$a, dat$b)
+# DRY_RUN=1 builds + reports the tables locally without touching the servers
+# (used to validate inflation shapes; e.g. N_ROWS=1000 DRY_RUN=1 Rscript setup.R).
+if (nzchar(Sys.getenv("DRY_RUN"))) {
+  cat("\nDRY_RUN: tables built locally; skipping upload + workspace save.\n")
+  quit(save = "no")
+}
+
+upload_opal(tables)
+upload_arma(tables)
 
 # --- 4. Save a DataSHIELD workspace per backend -----------------------------
-# Logs in (assigning tableA to D), saves the session as WORKSPACE, logs out.
-# datashield.login(restore = WORKSPACE) in the benchmark then has data to load.
+# Logs in (assigning the CNSIM table to D), saves the session as WORKSPACE, logs
+# out. datashield.login(restore = WORKSPACE) in the benchmark then has data to
+# load.
 save_workspace <- function(be) {
   cat(sprintf("\n== Workspace (%s) ==\n", be))
   ld <- login_for(build_logins(), be)
@@ -112,6 +170,8 @@ save_workspace <- function(be) {
   datashield.logout(cn)
   cat(sprintf("saved workspace '%s' on %s\n", WORKSPACE, be))
 }
-for (be in BACKENDS) save_workspace(be)
+for (be in BACKENDS)
+  tryCatch(save_workspace(be), error = function(e)
+    message(sprintf("workspace save skipped on %s (unavailable): %s", be, conditionMessage(e))))
 
 cat("\nSetup complete.\n")
