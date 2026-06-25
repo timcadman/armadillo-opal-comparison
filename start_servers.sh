@@ -16,7 +16,7 @@ set -euo pipefail
 # --- Paths (override via env if your layout differs) ------------------------
 # Defaults are $HOME-relative so the script is portable across machines/users;
 # the Armadillo checkout is auto-detected among common locations.
-OPAL_COMPOSE_DIR="${OPAL_COMPOSE_DIR:-$HOME/Library/CloudStorage/GoogleDrive-timcadman@gmail.com/Mi unidad/Work/repos/testing/opal-localhost}"
+OPAL_COMPOSE_DIR="${OPAL_COMPOSE_DIR:-$HOME/git-repos/opal-docker}"
 if [ -z "${ARMADILLO_DIR:-}" ]; then
   for d in "$HOME/git-repos/molgenis/molgenis-service-armadillo" \
            "$HOME/git-repos/ds-molgenis/molgenis-service-armadillo"; do

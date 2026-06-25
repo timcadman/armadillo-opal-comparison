@@ -99,9 +99,7 @@ DATASETS <- list(
   survival = list(rda = "SURVIVAL/EXPAND_NO_MISSING/EXPAND_NO_MISSING1.rda",
                   table = "SURVIVAL", symbol = "DS", kind = "survival", id_cols = c("id")),
   cluster  = list(rda = "CLUSTER/CLUSTER_SLO1.rda", table = "CLUSTER", symbol = "DC",
-                  kind = "cluster", id_cols = c("idSurgery", "idDoctor")),
-  gamlss   = list(rda = "GAMLSS/gamlss1.rda", table = "GAMLSS", symbol = "DG", kind = "flat"),
-  anthro   = list(rda = "ANTHRO/anthro1.rda", table = "ANTHRO", symbol = "DA", kind = "flat")
+                  kind = "cluster", id_cols = c("idSurgery", "idDoctor"))
 )
 
 # Restrict the active datasets via env (comma-separated keys), e.g. BENCH_DATASETS=cnsim
@@ -174,3 +172,39 @@ build_logins <- function() {
 
 # A single-server logindata row for one backend.
 login_for <- function(logindata, be) logindata[logindata$server == be, , drop = FALSE]
+
+# --- Discordant data for ds.dataFrameFill -----------------------------------
+# dataFrameFill harmonises a data frame across studies that have DIFFERENT
+# columns, so it needs >= 2 studies whose columns disagree. We model that on a
+# single backend by logging in TWICE (two sessions = two "studies"), each
+# pointing at a table with a different column set (sharing one column).
+DISC_COLS <- list(
+  DISCORDANT_1 = c("LAB_TSC", "LAB_HDL"),
+  DISCORDANT_2 = c("LAB_TSC", "GENDER")
+)
+
+# Two-session login to ONE backend, each session at a discordant table.
+# datashield.login(assign = TRUE, symbol = "D") then gives each study a
+# discordant D. Used only by the ds.dataFrameFill benchmark op.
+build_discordant_login <- function(be) {
+  basic <- identical(tolower(Sys.getenv("ARMA_AUTH", "token")), "basic")
+  tok   <- if (basic) NULL else arma_token()
+  b <- DSI::newDSLoginBuilder(.silent = TRUE)
+  for (i in seq_along(DISC_COLS)) {
+    nm  <- paste0("disc", i)
+    tbl <- ds_table_ref(be, names(DISC_COLS)[i])
+    if (be == "opal") {
+      b$append(server = nm, url = OPAL_URL, user = OPAL_USER, password = OPAL_PASS,
+               table = tbl, driver = "OpalDriver")
+    } else {
+      profile <- if (be == "armadillo_rserve") ARMA_RSERVE_PROFILE else ARMA_PROFILE
+      if (basic)
+        b$append(server = nm, url = ARMA_URL, user = ARMA_USER, password = ARMA_PASS,
+                 table = tbl, driver = "ArmadilloDriver", profile = profile)
+      else
+        b$append(server = nm, url = ARMA_URL, token = tok,
+                 table = tbl, driver = "ArmadilloDriver", profile = profile)
+    }
+  }
+  b$build()
+}

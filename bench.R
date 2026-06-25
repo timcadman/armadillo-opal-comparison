@@ -1,17 +1,23 @@
 # ==============================================================================
-# The benchmark. Measures operations/second for each DataSHIELD ds.* /
-# datashield.* function on each backend, plus login / logout / workspace_load.
+# The benchmark. Two scenarios over the analysis-driven core function set
+# (docs/core-functions.md):
 #
-#   Rscript bench.R
-#   DURATION_SEC=2 REPS=1 Rscript bench.R     # quick smoke run
+#   SCENARIO 1 -- primitives, true server compute time (single-command ops):
+#     COMPUTE=1 Rscript bench.R                 # -> results/compute.csv
+#
+#   SCENARIO 2 -- full ds.*/datashield.* function calls, ops/sec, with the DSI
+#     poll-sleep lowered so the client-side wait doesn't dominate fast ops:
+#     POLL_SLEEP0=0.002 Rscript bench.R         # -> results/rates.csv
+#
+# Helpers:
+#   DURATION_SEC=2 REPS=1 POLL_SLEEP0=0.002 Rscript bench.R   # quick smoke run
 #   PROBE=1 Rscript bench.R                    # validate every call form, no timing
 #
-# Each (backend x op x rep) cell runs the op for DURATION_SEC, counting completed
-# calls. Repetitions are independent blocks, each shuffled into a fresh random
-# order. Results are written incrementally to results/rates.csv and failures to
-# results/failures.csv. A dropped backend is healed (Opal auto-restarted if
-# OPAL_COMPOSE is set) and retried; one that cannot be healed is skipped for the
-# rest of the run and re-probed at the next repetition.
+# Scenario 2: each (backend x op x rep) cell runs the op for DURATION_SEC,
+# counting completed calls; reps are independent shuffled blocks. Results are
+# written incrementally to results/rates.csv (failures to results/failures.csv).
+# A dropped backend is healed (Opal auto-restarted if OPAL_COMPOSE is set) and
+# retried; one that cannot be healed is skipped and re-probed next repetition.
 # Output columns: backend, op, category, rep, count, elapsed, rate
 # ==============================================================================
 
@@ -53,6 +59,15 @@ build_conns <- function() {
 conns <- build_conns()
 if (!length(conns)) stop("No backends available; nothing to benchmark.")
 
+# Cached discordant 2-session connection per backend, built lazily on first use.
+# Only ds.dataFrameFill needs it (it harmonises studies with disagreeing columns).
+.disc_cache <- new.env(parent = emptyenv())
+disc_conn <- function(be) {
+  if (is.null(.disc_cache[[be]]))
+    .disc_cache[[be]] <- datashield.login(build_discordant_login(be), assign = TRUE, symbol = "D")
+  .disc_cache[[be]]
+}
+
 # Designate a connection as the DSI default so functions that don't forward
 # `datasources` to their internal calls still resolve it.
 use_conn <- function(cn) {
@@ -86,161 +101,60 @@ ds_ops <- function(be) list(
     ds.mean         = function(cn) ds.mean(x = "D$LAB_TSC", type = "combine", datasources = cn),
     ds.var          = function(cn) ds.var(x = "D$LAB_TSC", type = "combine", datasources = cn),
     ds.quantileMean = function(cn) ds.quantileMean(x = "D$LAB_HDL", datasources = cn),
-    ds.meanSdGp     = function(cn) ds.meanSdGp(x = "D$LAB_TSC", y = "D$GENDER", type = "combine", datasources = cn),
-    ds.meanByClass  = function(cn) ds.meanByClass(x = "D", outvar = "LAB_TSC", covar = "GENDER", datasources = cn),
-    ds.skewness     = function(cn) ds.skewness(x = "D$LAB_TSC", method = 1, type = "combine", datasources = cn),
-    ds.kurtosis     = function(cn) ds.kurtosis(x = "D$LAB_TSC", method = 1, type = "combine", datasources = cn),
     ds.summary      = function(cn) ds.summary(x = "D$LAB_TSC", datasources = cn)
   ),
   correlation = list(
-    ds.cor     = function(cn) ds.cor(x = "D$LAB_TSC", y = "D$LAB_HDL", type = "combine", datasources = cn),
-    ds.cov     = function(cn) ds.cov(x = "D$LAB_TSC", y = "D$LAB_HDL", type = "combine", datasources = cn),
-    ds.corTest = function(cn) ds.corTest(x = "D$LAB_TSC", y = "D$LAB_HDL", method = "pearson", datasources = cn),
-    ds.hetcor  = function(cn) ds.hetcor(data = "D", datasources = cn)
+    ds.cor = function(cn) ds.cor(x = "D$LAB_TSC", y = "D$LAB_HDL", type = "combine", datasources = cn)
   ),
   metadata = list(
-    ds.dim        = function(cn) ds.dim(x = "D", type = "combine", datasources = cn),
-    ds.length     = function(cn) ds.length(x = "D$LAB_TSC", type = "combine", datasources = cn),
-    ds.colnames   = function(cn) ds.colnames(x = "D", datasources = cn),
-    ds.names      = function(cn) ds.names(xname = "D", datasources = cn),
-    ds.class      = function(cn) ds.class(x = "D$LAB_TSC", datasources = cn),
-    ds.exists     = function(cn) ds.exists(x = "D", datasources = cn),
-    ds.testObjExists = function(cn) ds.testObjExists(test.obj.name = "D", datasources = cn),
-    ds.metadata   = function(cn) ds.metadata(x = "D", datasources = cn),
-    ds.isNA       = function(cn) ds.isNA(x = "D$LAB_HDL", datasources = cn),
-    ds.isValid    = function(cn) ds.isValid(x = "D$LAB_TSC", datasources = cn),
-    ds.numNA      = function(cn) ds.numNA(x = "D$LAB_HDL", datasources = cn),
-    ds.levels     = function(cn) ds.levels(x = "D$GENDER", datasources = cn),
-    ds.ls         = function(cn) ds.ls(datasources = cn),
-    ds.message    = function(cn) ds.message(message.obj.name = "D", datasources = cn),
-    ds.look       = function(cn) ds.look(toAggregate = "lengthDS('D$LAB_TSC')", datasources = cn),
-    ds.listServersideFunctions = function(cn) ds.listServersideFunctions(datasources = cn),
-    ds.listClientsideFunctions = function(cn) ds.listClientsideFunctions(),
-    ds.listDisclosureSettings  = function(cn) ds.listDisclosureSettings(datasources = cn),
-    ds.listOpals  = function(cn) ds.listOpals(),
-    ds.setDefaultOpals = function(cn) ds.setDefaultOpals(opal.name = ".dscn")
+    ds.dim      = function(cn) ds.dim(x = "D", type = "combine", datasources = cn),
+    ds.length   = function(cn) ds.length(x = "D$LAB_TSC", type = "combine", datasources = cn),
+    ds.colnames = function(cn) ds.colnames(x = "D", datasources = cn),
+    ds.class    = function(cn) ds.class(x = "D$LAB_TSC", datasources = cn),
+    ds.exists   = function(cn) ds.exists(x = "D", datasources = cn),
+    ds.numNA    = function(cn) ds.numNA(x = "D$LAB_HDL", datasources = cn),
+    ds.levels   = function(cn) ds.levels(x = "D$GENDER", datasources = cn),
+    ds.ls       = function(cn) ds.ls(datasources = cn)
   ),
   coercion = list(
-    ds.asNumeric     = function(cn) ds.asNumeric(x.name = "D$GENDER", newobj = "an", datasources = cn),
-    ds.asInteger     = function(cn) ds.asInteger(x.name = "D$GENDER", newobj = "ai", datasources = cn),
-    ds.asCharacter   = function(cn) ds.asCharacter(x.name = "D$GENDER", newobj = "ac", datasources = cn),
-    ds.asLogical     = function(cn) ds.asLogical(x.name = "D$LAB_TSC", newobj = "alo", datasources = cn),
-    ds.asFactor      = function(cn) ds.asFactor(input.var.name = "D$DIS_CVA", newobj.name = "af", datasources = cn),
-    ds.asFactorSimple = function(cn) ds.asFactorSimple(input.var.name = "D$DIS_CVA", newobj.name = "afs", datasources = cn),
-    ds.asList        = function(cn) ds.asList(x.name = "D", newobj = "al", datasources = cn),
-    ds.asMatrix      = function(cn) ds.asMatrix(x.name = "D$LAB_TSC", newobj = "am", datasources = cn),
-    ds.asDataMatrix  = function(cn) ds.asDataMatrix(x.name = "D$GENDER", newobj = "adm", datasources = cn)
+    ds.asInteger    = function(cn) ds.asInteger(x.name = "D$GENDER", newobj = "ai", datasources = cn),
+    ds.asCharacter  = function(cn) ds.asCharacter(x.name = "D$GENDER", newobj = "ac", datasources = cn),
+    ds.asFactor     = function(cn) ds.asFactor(input.var.name = "D$DIS_CVA", newobj.name = "af", datasources = cn),
+    ds.asDataMatrix = function(cn) ds.asDataMatrix(x.name = "D$GENDER", newobj = "adm", datasources = cn)
   ),
   transform = list(
-    ds.assign       = function(cn) ds.assign(toAssign = "D$LAB_TSC*2", newobj = "ao", datasources = cn),
-    ds.make         = function(cn) ds.make(toAssign = "D$LAB_TSC*2", newobj = "md", datasources = cn),
-    ds.Boole        = function(cn) ds.Boole(V1 = "D$LAB_TSC", V2 = "D$LAB_TRIG", Boolean.operator = "==", newobj = "bo", datasources = cn),
-    ds.log          = function(cn) ds.log(x = "D$LAB_HDL", newobj = "lg", datasources = cn),
-    ds.exp          = function(cn) ds.exp(x = "D$LAB_HDL", newobj = "ex", datasources = cn),
-    ds.sqrt         = function(cn) ds.sqrt(x = "D$LAB_HDL", newobj = "sq", datasources = cn),
-    ds.abs          = function(cn) ds.abs(x = "D$LAB_TSC", newobj = "ab", datasources = cn),
-    ds.vectorCalc   = function(cn) ds.vectorCalc(x = c("D$LAB_TSC", "D$LAB_HDL"), calc = "+", newobj = "vc", datasources = cn)
+    ds.assign = function(cn) ds.assign(toAssign = "D$LAB_TSC*2", newobj = "ao", datasources = cn),
+    ds.make   = function(cn) ds.make(toAssign = "D$LAB_TSC*2", newobj = "md", datasources = cn),
+    ds.Boole  = function(cn) ds.Boole(V1 = "D$LAB_TSC", V2 = "D$LAB_TRIG", Boolean.operator = "==", newobj = "bo", datasources = cn)
   ),
   recode = list(
-    ds.recodeValues  = function(cn) ds.recodeValues(var.name = "D$DIS_CVA", values2replace.vector = c(0, 1), new.values.vector = c(10, 20), newobj = "rv", datasources = cn),
-    ds.recodeLevels  = function(cn) ds.recodeLevels(x = "D$GENDER", newCategories = c("g0", "g1"), newobj = "rl", datasources = cn),
+    ds.recodeValues   = function(cn) ds.recodeValues(var.name = "D$DIS_CVA", values2replace.vector = c(0, 1), new.values.vector = c(10, 20), newobj = "rv", datasources = cn),
+    ds.recodeLevels   = function(cn) ds.recodeLevels(x = "D$GENDER", newCategories = c("g0", "g1"), newobj = "rl", datasources = cn),
     ds.changeRefGroup = function(cn) ds.changeRefGroup(x = "D$GENDER", ref = "1", newobj = "crg", datasources = cn)
   ),
   vector = list(
-    ds.c           = function(cn) ds.c(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "cc", datasources = cn),
-    ds.unique      = function(cn) ds.unique(x.name = "D$GENDER", newobj = "uq", datasources = cn),
-    ds.seq         = function(cn) ds.seq(FROM.value.char = "1", BY.value.char = "1", LENGTH.OUT.value.char = "10", newobj = "sq2", datasources = cn),
-    ds.rep         = function(cn) ds.rep(x1 = 4, times = 6, length.out = NA, each = 1, source.x1 = "clientside", source.times = "c", source.length.out = NULL, source.each = "c", x1.includes.characters = FALSE, newobj = "rep1", datasources = cn),
-    ds.replaceNA   = function(cn) ds.replaceNA(x = "D$LAB_HDL", forNA = list(0), newobj = "rna", datasources = cn),
-    ds.completeCases = function(cn) ds.completeCases(x1 = "D", newobj = "ccx", datasources = cn)
-  ),
-  list = list(
-    ds.list   = function(cn) ds.list(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "li", datasources = cn),
-    ds.unList = function(cn) ds.unList(x.name = "li", newobj = "ul", datasources = cn)
+    ds.rep       = function(cn) ds.rep(x1 = 4, times = 6, length.out = NA, each = 1, source.x1 = "clientside", source.times = "c", source.length.out = NULL, source.each = "c", x1.includes.characters = FALSE, newobj = "rep1", datasources = cn),
+    ds.replaceNA = function(cn) ds.replaceNA(x = "D$LAB_HDL", forNA = list(0), newobj = "rna", datasources = cn)
   ),
   dataframe = list(
-    ds.dataFrameSubset_row = function(cn) ds.dataFrameSubset(df.name = "D", V1.name = "D$LAB_TSC", V2.name = "D$LAB_HDL", Boolean.operator = "!=", newobj = "sub_row", datasources = cn),
-    ds.dataFrameSubset_col = function(cn) ds.dataFrameSubset(df.name = "D", V1.name = "D$LAB_TSC", V2.name = "D$LAB_TSC", Boolean.operator = ">=", keep.cols = c(1, 2, 3), newobj = "sub_col", datasources = cn),
-    ds.dataFrameSort = function(cn) ds.dataFrameSort(df.name = "D", sort.key.name = "D$LAB_TSC", newobj = "sorted", datasources = cn),
-    ds.dataFrame  = function(cn) ds.dataFrame(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "df2", datasources = cn),
-    ds.dataFrameFill = function(cn) ds.dataFrameFill(df.name = "D", newobj = "filled", datasources = cn),
-    ds.dmtC2S     = function(cn) ds.dmtC2S(dfdata = data.frame(a = 1:5, b = 6:10), newobj = "dmt", datasources = cn),
-    ds.cbind      = function(cn) ds.cbind(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "cb", datasources = cn),
-    ds.rbind      = function(cn) ds.rbind(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "rb", datasources = cn),
-    ds.merge      = function(cn) ds.merge(x.name = "D", y.name = "D2", by.x.names = "key", by.y.names = "key", newobj = "mg", datasources = cn),
-    ds.sample     = function(cn) ds.sample(x = "D", size = 100, newobj = "smp", datasources = cn)
+    ds.dataFrameSubset = function(cn) ds.dataFrameSubset(df.name = "D", V1.name = "D$LAB_TSC", V2.name = "D$LAB_HDL", Boolean.operator = "!=", newobj = "sub_row", datasources = cn),
+    ds.dataFrame       = function(cn) ds.dataFrame(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "df2", datasources = cn),
+    ds.dataFrameFill   = function(cn) ds.dataFrameFill(df.name = "D", newobj = "filled", datasources = disc_conn(be)),
+    ds.cbind           = function(cn) ds.cbind(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "cb", datasources = cn),
+    ds.merge           = function(cn) ds.merge(x.name = "D", y.name = "D2", by.x.names = "key", by.y.names = "key", newobj = "mg", datasources = cn)
   ),
   reshape = list(
-    ds.reShape       = function(cn) ds.reShape(data.name = "DS", v.names = "age.60", timevar.name = "time.id", idvar.name = "id", direction = "wide", newobj = "rsh", datasources = cn),
-    ds.subset        = function(cn) ds.subset(x = "D", subset = "subD", rows = c(1:50), cols = c(1, 2), datasources = cn),
-    ds.subsetByClass = function(cn) ds.subsetByClass(x = "D", subsets = "sbc", variables = "GENDER", datasources = cn)
+    ds.reShape = function(cn) ds.reShape(data.name = "DS", v.names = "age.60", timevar.name = "time.id", idvar.name = "id", direction = "wide", newobj = "rsh", datasources = cn)
   ),
   tabulation = list(
-    ds.table         = function(cn) ds.table(rvar = "D$GENDER", cvar = "D$DIS_CVA", datasources = cn),
-    ds.table1D       = function(cn) ds.table1D(x = "D$GENDER", datasources = cn),
-    ds.table2D       = function(cn) ds.table2D(x = "D$DIS_DIAB", y = "D$GENDER", datasources = cn),
-    ds.tapply        = function(cn) ds.tapply(X.name = "D$LAB_TSC", INDEX.names = "D$GENDER", FUN.name = "mean", datasources = cn),
-    ds.tapply.assign = function(cn) ds.tapply.assign(X.name = "D$LAB_TSC", INDEX.names = "D$GENDER", FUN.name = "mean", newobj = "ta", datasources = cn)
-  ),
-  matrix = list(
-    ds.matrix          = function(cn) ds.matrix(mdata = 2, from = "clientside.scalar", nrows.scalar = 3, ncols.scalar = 4, newobj = "m2", datasources = cn),
-    ds.matrixDet       = function(cn) ds.matrixDet(M1 = "mat", newobj = "mdet", datasources = cn),
-    ds.matrixDet.report = function(cn) ds.matrixDet.report(M1 = "mat", datasources = cn),
-    ds.matrixInvert    = function(cn) ds.matrixInvert(M1 = "mat", newobj = "minv", datasources = cn),
-    ds.matrixMult      = function(cn) ds.matrixMult(M1 = "mat", M2 = "mat", newobj = "mmul", datasources = cn),
-    ds.matrixTranspose = function(cn) ds.matrixTranspose(M1 = "mat", newobj = "mtr", datasources = cn),
-    ds.matrixDiag      = function(cn) ds.matrixDiag(x1 = "mat", aim = "serverside.matrix.2.vector", newobj = "mdg", datasources = cn),
-    ds.matrixDimnames  = function(cn) ds.matrixDimnames(M1 = "mat", dimnames = list(c("a", "b", "c", "d"), c("a", "b", "c", "d")), newobj = "mdn", datasources = cn),
-    ds.rowColCalc      = function(cn) ds.rowColCalc(x = "numdf", operation = "rowSums", newobj = "rcc", datasources = cn)
-  ),
-  spline = list(
-    ds.ns       = function(cn) ds.ns(x = "D$PM_BMI_CONTINUOUS", df = 3, newobj = "nsDS", datasources = cn),
-    ds.lspline  = function(cn) ds.lspline(x = "D$PM_BMI_CONTINUOUS", knots = c(15, 25, 35), newobj = "lsp", datasources = cn),
-    ds.qlspline = function(cn) ds.qlspline(x = "D$PM_BMI_CONTINUOUS", q = 4, na.rm = TRUE, newobj = "qsp", datasources = cn),
-    ds.elspline = function(cn) ds.elspline(x = "D$PM_BMI_CONTINUOUS", n = 3, newobj = "esp", datasources = cn)
+    ds.table = function(cn) ds.table(rvar = "D$GENDER", cvar = "D$DIS_CVA", datasources = cn)
   ),
   glm = list(
-    ds.glm          = function(cn) ds.glm(formula = "LAB_TSC ~ LAB_TRIG", data = "D", family = "gaussian", datasources = cn),
-    ds.glm_binomial = function(cn) ds.glm(formula = "DIS_DIAB ~ LAB_TSC + GENDER", data = "D", family = "binomial", datasources = cn),
-    ds.glmSLMA      = function(cn) ds.glmSLMA(formula = "LAB_TSC ~ LAB_TRIG", family = "gaussian", dataName = "D", newobj = "glmslma", datasources = cn),
-    ds.glmSummary   = function(cn) ds.glmSummary(x = "glm.mod", datasources = cn),
-    ds.glmPredict   = function(cn) ds.glmPredict("glm.mod", newdataname = NULL, output.type = "response", se.fit = FALSE, na.action = "na.pass", datasources = cn),
-    ds.auc          = function(cn) ds.auc(pred = "D$LAB_TSC", y = "D$DIS_DIAB", datasources = cn)
+    ds.glm     = function(cn) ds.glm(formula = "LAB_TSC ~ LAB_TRIG", data = "D", family = "gaussian", datasources = cn),
+    ds.glmSLMA = function(cn) ds.glmSLMA(formula = "LAB_TSC ~ LAB_TRIG", family = "gaussian", dataName = "D", newobj = "glmslma", datasources = cn)
   ),
   `mixed-model` = list(
-    ds.lmerSLMA  = function(cn) ds.lmerSLMA(formula = "incid_rate ~ trtGrp + Male + (1|idDoctor)", dataName = "DC", datasources = cn),
-    ds.glmerSLMA = function(cn) ds.glmerSLMA(formula = "incid_rate ~ trtGrp + Male + (1|idDoctor)", family = "poisson", dataName = "DC", datasources = cn)
-  ),
-  survival = list(
-    ds.lexis = function(cn) ds.lexis(data = "DS", intervalWidth = c(1.0, 1.5, 2.5), idCol = "DS$id", entryCol = "DS$starttime", exitCol = "DS$endtime", statusCol = "DS$cens", variables = c("DS$age.60"), expandDF = "EM.new", datasources = cn)
-  ),
-  distributional = list(
-    ds.gamlss = function(cn) ds.gamlss(formula = "e3_bw ~ e3_gac_None", sigma.formula = "e3_bw ~ e3_gac_None", data = "DG", family = "NO()", centiles = TRUE, xvar = "DG$e3_gac_None", newobj = "z_scores", datasources = cn)
-  ),
-  imputation = list(
-    ds.mice      = function(cn) ds.mice(data = "D", m = 1, seed = "NA", datasources = cn),
-    ds.mdPattern = function(cn) ds.mdPattern(x = "D", datasources = cn)
-  ),
-  growth = list(
-    ds.getWGSR       = function(cn) ds.getWGSR(sex = "DA$sex", firstPart = "DA$weight", secondPart = "DA$height", index = "wfh", newobj = "wgsr", datasources = cn),
-    ds.bp_standards  = function(cn) ds.bp_standards(sex = "DA$sex", age = "DA$age", height = "DA$height", bp = "DA$muac", systolic = TRUE, newobj = "bps", datasources = cn),
-    ds.igb_standards = function(cn) ds.igb_standards(gagebrth = "ga_days", val = "DA$weight", sex = "sexMF", var = "wtkg", newobj = "igb", datasources = cn)
-  ),
-  plot = list(
-    ds.histogram   = function(cn) ds.histogram(x = "D$LAB_TSC", datasources = cn),
-    ds.boxPlot     = function(cn) ds.boxPlot(x = "D$LAB_TSC", datasources = cn),
-    ds.scatterPlot = function(cn) ds.scatterPlot(x = "D$LAB_TSC", y = "D$LAB_HDL", datasources = cn),
-    ds.heatmapPlot = function(cn) ds.heatmapPlot(x = "D$LAB_TSC", y = "D$LAB_HDL", datasources = cn),
-    ds.contourPlot = function(cn) ds.contourPlot(x = "D$LAB_TSC", y = "D$LAB_HDL", datasources = cn),
-    ds.densityGrid = function(cn) ds.densityGrid(x = "D$LAB_TSC", y = "D$LAB_HDL", datasources = cn),
-    ds.forestplot  = function(cn) ds.forestplot(mod = ds.glmSLMA(formula = "LAB_TSC ~ LAB_TRIG", family = "gaussian", dataName = "D", datasources = cn))
-  ),
-  random = list(
-    ds.rNorm   = function(cn) ds.rNorm(samp.size = 1000, mean = 0, sd = 1, newobj = "rn", seed.as.integer = 27, datasources = cn),
-    ds.rUnif   = function(cn) ds.rUnif(samp.size = 1000, min = 0, max = 1, newobj = "ru", seed.as.integer = 27, datasources = cn),
-    ds.rPois   = function(cn) ds.rPois(samp.size = 1000, lambda = 1, newobj = "rp", seed.as.integer = 27, datasources = cn),
-    ds.rBinom  = function(cn) ds.rBinom(samp.size = 1000, size = 10, prob = 0.5, newobj = "rbn", seed.as.integer = 27, datasources = cn),
-    ds.setSeed = function(cn) ds.setSeed(seed.as.integer = 1234, datasources = cn)
+    ds.lmerSLMA = function(cn) ds.lmerSLMA(formula = "incid_rate ~ trtGrp + Male + (1|idDoctor)", dataName = "DC", datasources = cn)
   ),
   objects = list(
     ds.rm = function(cn) { ds.assign(toAssign = "D$LAB_TSC", newobj = "torm", datasources = cn); ds.rm(x.names = "torm", datasources = cn) }
@@ -248,22 +162,13 @@ ds_ops <- function(be) list(
   # DSI infrastructure (datashield.*) that hits the server. login/logout/
   # workspace_load are timed separately by session_rows().
   dsi = list(
-    datashield.symbols        = function(cn) datashield.symbols(cn),
     datashield.tables         = function(cn) datashield.tables(cn),
-    datashield.table_status   = function(cn) datashield.table_status(cn, table_a_ref(be)),
-    datashield.pkg_check      = function(cn) datashield.pkg_check(cn, "dsBase"),
     datashield.pkg_status     = function(cn) datashield.pkg_status(cn),
-    datashield.methods        = function(cn) datashield.methods(cn),
-    datashield.method_status  = function(cn) datashield.method_status(cn),
     datashield.profiles       = function(cn) datashield.profiles(cn),
-    datashield.sessions       = function(cn) datashield.sessions(cn),
-    datashield.resources      = function(cn) datashield.resources(cn),
-    datashield.resource_status = function(cn) datashield.resource_status(cn),
     datashield.workspaces     = function(cn) datashield.workspaces(cn),
     datashield.aggregate      = function(cn) datashield.aggregate(cn, "dimDS('D')"),
     datashield.assign.expr    = function(cn) datashield.assign.expr(cn, "ae2", "D$LAB_TSC * 2"),
-    datashield.workspace_save = function(cn) datashield.workspace_save(cn, "benchws"),
-    datashield.rm             = function(cn) { datashield.assign.expr(cn, "torm2", "D$LAB_TSC"); datashield.rm(cn, "torm2") }
+    datashield.workspace_save = function(cn) datashield.workspace_save(cn, "benchws")
   )
 )
 
@@ -278,31 +183,9 @@ flatten_ops <- function(be) {
 }
 
 # Prerequisite builders: run untimed (after reset) for ops that need a prior
-# server object. Keyed by op name; ops not listed need no prep. The matrix is a
-# diagonal (invertible) matrix so matrixInvert works as well as det/mult/transpose.
-build_mat <- function(cn) ds.matrixDiag(x1 = 2, aim = "clientside.scalar.2.matrix",
-  nrows.scalar = 4, newobj = "mat", datasources = cn)
-build_glm <- function(cn) ds.glmSLMA(formula = "D$LAB_TSC~D$LAB_TRIG",
-  family = "gaussian", newobj = "glm.mod", datasources = cn)
-build_list <- function(cn) ds.list(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "li", datasources = cn)
-build_numdf <- function(cn) ds.dataFrame(x = c("D$LAB_TSC", "D$LAB_HDL"), newobj = "numdf", datasources = cn)
-# igb_standards needs a gestational-age-in-days variable (the anthro `age` is
-# child age in months, out of the 168-294 day INTERGROWTH range) and a sex
-# variable coded Male/Female (the data codes it 1/2).
-build_igb <- function(cn) {
-  ds.assign(toAssign = "DA$age*0+280", newobj = "ga_days", datasources = cn)
-  ds.recodeValues(var.name = "DA$sex", values2replace.vector = c("1", "2"),
-                  new.values.vector = c("Male", "Female"), newobj = "sexMF", datasources = cn)
-}
-PREP_FOR <- list(
-  ds.matrixDet = build_mat, ds.matrixDet.report = build_mat, ds.matrixInvert = build_mat,
-  ds.matrixMult = build_mat, ds.matrixTranspose = build_mat, ds.matrixDiag = build_mat,
-  ds.matrixDimnames = build_mat,
-  ds.rowColCalc = build_numdf,
-  ds.glmSummary = build_glm, ds.glmPredict = build_glm,
-  ds.unList = build_list,
-  ds.igb_standards = build_igb
-)
+# server object. Keyed by op name; ops not listed need no prep. The current core
+# function set has no such ops, so this is empty (kept so make_cell can look up).
+PREP_FOR <- list()
 
 # --- Session timing (login / logout / workspace_load) -----------------------
 # Throwaway connections so it doesn't disturb the persistent ones. Returns rows
@@ -352,6 +235,173 @@ if (nzchar(Sys.getenv("PROBE"))) {
     cat(sprintf("  -- %s: %d/%d OK, %d FAIL --\n", be, nok, length(ops), length(ops) - nok))
   }
   for (be in names(conns)) try(datashield.logout(conns[[be]]), silent = TRUE)
+  quit(save = "no")
+}
+
+# --- CAPTURE mode: dump the serverside calls each op issues -------------------
+# Every op resolves to one or more datashield.aggregate / datashield.assign.expr
+# calls; each is a single-command primitive. Tracing them lets the primitive set
+# be derived from real usage rather than hand-picked.
+#   CAPTURE=1 Rscript bench.R
+if (nzchar(Sys.getenv("CAPTURE"))) {
+  CAP <- new.env(parent = emptyenv()); CAP$list <- list()
+  rec <- function(kind, e)
+    CAP$list[[length(CAP$list) + 1L]] <-
+      c(kind, if (is.character(e)) e else paste(deparse(e), collapse = " "))
+  assign("rec", rec, envir = globalenv()); assign("CAP", CAP, envir = globalenv())
+  suppressMessages({
+    trace("datashield.aggregate",   tracer = quote(.GlobalEnv$rec("aggregate", expr)), print = FALSE, where = asNamespace("DSI"))
+    trace("datashield.assign.expr", tracer = quote(.GlobalEnv$rec("assign",    expr)), print = FALSE, where = asNamespace("DSI"))
+  })
+  # Capture/validate on a stable backend (Opal is OOM-prone); the serverside
+  # call expressions are backend-independent.
+  be <- if ("armadillo" %in% names(conns)) "armadillo" else names(conns)[1]
+  cn <- conns[[be]]; use_conn(cn)
+  calls <- list()                                   # distinct (kind, expr)
+  for (o in flatten_ops(be)) {
+    reset(cn)
+    CAP$list <- list()
+    suppressWarnings(suppressMessages(try(o$fn(cn), silent = TRUE)))
+    for (cl in CAP$list) {
+      key <- paste0(cl[1], "\t", cl[2])
+      if (is.null(calls[[key]])) calls[[key]] <- cl
+    }
+  }
+  # Drop pure plumbing (existence / message checks) -- not real computations.
+  is_plumbing <- function(expr) grepl("^(testObjExistsDS|messageDS|exists)\\(", expr)
+  # Validate each call standalone on a freshly reset connection; keep those that
+  # run without error (this drops calls referencing mid-op intermediate objects).
+  rows <- list()
+  for (cl in calls) {
+    kind <- cl[1]; expr <- cl[2]
+    if (is_plumbing(expr)) next
+    reset(cn)
+    ok <- tryCatch({
+      if (kind == "aggregate") datashield.aggregate(cn, expr)
+      else datashield.assign.expr(cn, "p_tmp", expr)
+      TRUE
+    }, error = function(e) FALSE)
+    fn <- sub("\\(.*$", "", expr)
+    cat(sprintf("%-9s %-22s %s\n", kind, fn, if (ok) "OK" else "skip (not standalone)"))
+    if (ok) rows[[length(rows) + 1L]] <- data.frame(kind = kind, fn = fn, expr = expr, stringsAsFactors = FALSE)
+  }
+  out <- do.call(rbind, rows)
+  prim_csv <- file.path(dirname(OUT_CSV), "primitives.csv")
+  dir.create(dirname(prim_csv), showWarnings = FALSE, recursive = TRUE)
+  write.csv(out, prim_csv, row.names = FALSE)
+  cat(sprintf("\n-- %d standalone single-command primitives -> %s --\n", nrow(out), prim_csv))
+  for (b in names(conns)) try(datashield.logout(conns[[b]]), silent = TRUE)
+  quit(save = "no")
+}
+
+# --- COMPUTE mode: true server compute time of single-command primitives -----
+# The throughput numbers above are client wall-clock and include the DSI async
+# poll-sleep (default 50 ms), which dominates fast ops. Each server records true
+# per-command execution timestamps; for ops that map to EXACTLY ONE server
+# command we read them back and report compute_ms = endDate - startDate.
+#   COMPUTE=1 Rscript bench.R   ->  results/compute.csv
+# Armadillo retains only the LAST command (GET /lastcommand), so this is valid
+# only for single-command primitives; Opal exposes the command by id. The
+# ISO-8601 startDate/endDate fields were verified from each server's source.
+# Columns: backend, op, rep, compute_ms, roundtrip_ms, client_ms
+#   compute_ms   server endDate - startDate (true execution time)
+#   roundtrip_ms low-level submit->poll(2 ms)->fetch wall-clock (~compute + network)
+#   client_ms    high-level datashield.* call (default 50 ms poll) -- the penalised number
+
+# Parse an ISO-8601 instant ("...Thh:mm:ss.SSSZ", or with a +HH:MM offset). We
+# only ever subtract two stamps from the SAME server, so stripping the zone and
+# parsing both as naive-UTC leaves the difference exact regardless of its zone.
+.parse_iso <- function(x) {
+  if (is.null(x) || length(x) != 1 || is.na(x) || !nzchar(x)) return(as.POSIXct(NA))
+  as.POSIXct(sub("([Zz]|[+-][0-9]{2}:?[0-9]{2})$", "", x),
+             format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC")
+}
+
+# True compute time (ms) of the just-completed command on a single node `conn`.
+# Read BEFORE dsFetch. Armadillo: GET /lastcommand DTO; Opal: command-by-id.
+command_compute_ms <- function(conn, res) tryCatch({
+  if (methods::is(conn, "ArmadilloConnection")) {
+    r <- httr::GET(handle = conn@handle, path = "/lastcommand",
+                   config = httr::add_headers(DSMolgenisArmadillo:::.get_auth_header(conn)))
+    cmd <- httr::content(r)
+  } else if (methods::is(conn, "OpalConnection")) {
+    cmd <- DSOpal:::.datashield.command(conn@opal, res@rval$rid)
+  } else stop("unsupported backend connection: ", paste(class(conn), collapse = "/"))
+  d <- as.numeric(.parse_iso(cmd$endDate) - .parse_iso(cmd$startDate), units = "secs") * 1000
+  if (length(d) == 1 && !is.na(d)) d else NA_real_
+}, error = function(e) NA_real_)
+
+# Single-command primitives: a low-level async submit (returns a result handle so
+# the command record is reachable) and the matching high-level call. Call forms
+# match proven ops in the registry above.
+compute_primitives <- function(be) {
+  agg <- function(name, expr) list(op = name,
+    submit = function(c1) dsAggregate(c1, expr, async = TRUE),
+    hl     = function(cn) datashield.aggregate(cn, expr))
+  asn <- function(name, sym, expr) list(op = name,
+    submit = function(c1) dsAssignExpr(c1, sym, expr, async = TRUE),
+    hl     = function(cn) datashield.assign.expr(cn, sym, expr))
+  # Max testable subset of the core set: each is exactly ONE server command and
+  # hand-callable. Aggregates wrap ds.dim/numNA/quantileMean/length/class/colnames;
+  # the arithmetic assign wraps ds.assign/make; assign.table is datashield.assign.table.
+  list(
+    agg("dimDS",          "dimDS('D')"),
+    agg("lengthDS",       "lengthDS('D$LAB_TSC')"),
+    agg("classDS",        "classDS('D$LAB_TSC')"),
+    agg("colnamesDS",     "colnamesDS('D')"),
+    agg("numNaDS",        "numNaDS('D$LAB_HDL')"),
+    agg("quantileMeanDS", "quantileMeanDS('D$LAB_HDL')"),
+    asn("assign.expr",    "ae_c", "D$LAB_TSC * 2"),
+    list(op = "assign.table",
+         submit = function(c1) dsAssignTable(c1, "scratch_c", table_a_ref(be),
+                                             NULL, FALSE, NULL, NULL, async = TRUE),
+         hl     = function(cn) datashield.assign.table(cn, "scratch_c", table_a_ref(be)))
+  )
+}
+
+if (nzchar(Sys.getenv("COMPUTE"))) {
+  creps   <- as.integer(Sys.getenv("COMPUTE_REPS", as.character(REPS)))
+  out_csv <- Sys.getenv("COMPUTE_CSV", file.path(dirname(OUT_CSV), "compute.csv"))
+  ccols   <- c("backend", "op", "rep", "compute_ms", "roundtrip_ms", "client_ms")
+  dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+  write.csv(setNames(data.frame(lapply(ccols, function(x) numeric(0))), ccols),
+            out_csv, row.names = FALSE)
+  append_c <- function(df)
+    write.table(df[, ccols], out_csv, sep = ",", row.names = FALSE,
+                col.names = FALSE, append = TRUE)
+
+  cat(sprintf("COMPUTE: %d reps/primitive, true server compute time -> %s\n", creps, out_csv))
+  for (be in names(conns)) {
+    cn <- conns[[be]]; c1 <- cn[[1]]
+    use_conn(cn)
+    cat(sprintf("\n== COMPUTE %s ==\n", be))
+    for (p in compute_primitives(be)) {
+      reset(cn)
+      try(p$hl(cn), silent = TRUE)                 # warm-up (excluded)
+      for (rep in seq_len(creps)) {
+        cms <- NA_real_; rt <- NA_real_; clm <- NA_real_
+        try({
+          t0  <- Sys.time()
+          res <- p$submit(c1)
+          repeat { if (dsIsCompleted(res)) break; Sys.sleep(0.002) }
+          cms <- command_compute_ms(c1, res)        # read BEFORE fetch
+          dsFetch(res)
+          rt  <- secs_since(t0) * 1000
+        }, silent = TRUE)
+        s <- Sys.time(); try(p$hl(cn), silent = TRUE); clm <- secs_since(s) * 1000
+        append_c(data.frame(backend = be, op = p$op, rep = rep,
+                            compute_ms = cms, roundtrip_ms = rt, client_ms = clm))
+      }
+      sub <- read.csv(out_csv)
+      sub <- sub[sub$backend == be & sub$op == p$op, ]
+      cat(sprintf("  %-13s compute %6.1f | roundtrip %6.1f | client %6.1f  ms (median, n=%d)\n",
+                  p$op, median(sub$compute_ms, na.rm = TRUE),
+                  median(sub$roundtrip_ms, na.rm = TRUE),
+                  median(sub$client_ms, na.rm = TRUE), nrow(sub)))
+    }
+  }
+  for (be in names(conns)) try(datashield.logout(conns[[be]]), silent = TRUE)
+  cat(sprintf("\nWrote compute timings -> %s\n", out_csv))
   quit(save = "no")
 }
 
