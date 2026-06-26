@@ -108,15 +108,9 @@ DATASETS <- list(
 .use_ds <- .use_ds[nzchar(.use_ds)]
 if (length(.use_ds) > 0) DATASETS <- DATASETS[.use_ds]
 
-# Back-compat refs used by build_logins() (default login table) and the
-# workspace save in setup.R. CNSIM is the default; the benchmark assigns every
-# dataset explicitly regardless.
+# Default login table (build_logins) + workspace save (setup.R). CNSIM is the
+# default; the benchmark assigns every dataset explicitly regardless.
 TABLE_A <- DATASETS$cnsim$table
-TABLE_B <- DATASETS$cnsim_b$table
-OPAL_TABLE_A <- ds_table_ref("opal", TABLE_A)
-OPAL_TABLE_B <- ds_table_ref("opal", TABLE_B)
-ARMA_TABLE_A <- ds_table_ref("armadillo", TABLE_A)
-ARMA_TABLE_B <- ds_table_ref("armadillo", TABLE_B)
 
 # --- Benchmark settings -----------------------------------------------------
 DURATION_SEC <- as.numeric(Sys.getenv("DURATION_SEC", "20"))  # seconds per cell
@@ -135,8 +129,8 @@ poll0 <- Sys.getenv("POLL_SLEEP0", "")
 if (nzchar(poll0)) options(datashield.polling.sleep.0 = as.numeric(poll0))
 
 # --- Per-backend helpers ----------------------------------------------------
-table_a_ref <- function(be) if (be == "opal") OPAL_TABLE_A else ARMA_TABLE_A
-table_b_ref <- function(be) if (be == "opal") OPAL_TABLE_B else ARMA_TABLE_B
+# Per-backend reference to the default benchmark table (CNSIM).
+table_a_ref <- function(be) ds_table_ref(be, TABLE_A)
 
 # Fetch the Armadillo OAuth token once and cache it in ARMA_TOKEN. Call this
 # BEFORE any timed datashield.login so the handshake is not part of the measured
@@ -147,64 +141,34 @@ arma_token <- function() {
   ARMA_TOKEN
 }
 
+# Append one Opal / one Armadillo login row. These two are the single place that
+# knows the driver + token-vs-basic-auth + profile branching (arma_token() is
+# cached, fetched once, outside any timed login). basic auth when ARMA_AUTH=basic.
+arma_basic  <- function() identical(tolower(Sys.getenv("ARMA_AUTH", "token")), "basic")
+
+opal_append <- function(b, server, table)
+  b$append(server = server, url = OPAL_URL, user = OPAL_USER, password = OPAL_PASS,
+           table = table, driver = "OpalDriver")
+
+arma_append <- function(b, server, table, profile) {
+  if (arma_basic())
+    b$append(server = server, url = ARMA_URL, user = ARMA_USER, password = ARMA_PASS,
+             table = table, driver = "ArmadilloDriver", profile = profile)
+  else
+    b$append(server = server, url = ARMA_URL, token = arma_token(),
+             table = table, driver = "ArmadilloDriver", profile = profile)
+}
+
 # Build a multi-server logindata object; subset per backend with login_for().
 # Both Armadillo backends point at the same server/data and differ only by
-# profile (default vs rserve). Auth is token-based unless ARMA_AUTH=basic.
+# profile (default vs rserve).
 build_logins <- function() {
-  basic <- identical(tolower(Sys.getenv("ARMA_AUTH", "token")), "basic")
-  tok   <- if (basic) NULL else arma_token()
   b <- DSI::newDSLoginBuilder(.silent = TRUE)
-  b$append(server = "opal", url = OPAL_URL, user = OPAL_USER, password = OPAL_PASS,
-           table = OPAL_TABLE_A, driver = "OpalDriver")
-  append_arma <- function(server, profile) {
-    if (basic) {
-      b$append(server = server, url = ARMA_URL, user = ARMA_USER, password = ARMA_PASS,
-               table = ARMA_TABLE_A, driver = "ArmadilloDriver", profile = profile)
-    } else {
-      b$append(server = server, url = ARMA_URL, token = tok,
-               table = ARMA_TABLE_A, driver = "ArmadilloDriver", profile = profile)
-    }
-  }
-  append_arma("armadillo",        ARMA_PROFILE)
-  append_arma("armadillo_rserve", ARMA_RSERVE_PROFILE)
+  opal_append(b, "opal",             table_a_ref("opal"))
+  arma_append(b, "armadillo",        table_a_ref("armadillo"),        ARMA_PROFILE)
+  arma_append(b, "armadillo_rserve", table_a_ref("armadillo_rserve"), ARMA_RSERVE_PROFILE)
   b$build()
 }
 
 # A single-server logindata row for one backend.
 login_for <- function(logindata, be) logindata[logindata$server == be, , drop = FALSE]
-
-# --- Discordant data for ds.dataFrameFill -----------------------------------
-# dataFrameFill harmonises a data frame across studies that have DIFFERENT
-# columns, so it needs >= 2 studies whose columns disagree. We model that on a
-# single backend by logging in TWICE (two sessions = two "studies"), each
-# pointing at a table with a different column set (sharing one column).
-DISC_COLS <- list(
-  DISCORDANT_1 = c("LAB_TSC", "LAB_HDL"),
-  DISCORDANT_2 = c("LAB_TSC", "GENDER")
-)
-
-# Two-session login to ONE backend, each session at a discordant table.
-# datashield.login(assign = TRUE, symbol = "D") then gives each study a
-# discordant D. Used only by the ds.dataFrameFill benchmark op.
-build_discordant_login <- function(be) {
-  basic <- identical(tolower(Sys.getenv("ARMA_AUTH", "token")), "basic")
-  tok   <- if (basic) NULL else arma_token()
-  b <- DSI::newDSLoginBuilder(.silent = TRUE)
-  for (i in seq_along(DISC_COLS)) {
-    nm  <- paste0("disc", i)
-    tbl <- ds_table_ref(be, names(DISC_COLS)[i])
-    if (be == "opal") {
-      b$append(server = nm, url = OPAL_URL, user = OPAL_USER, password = OPAL_PASS,
-               table = tbl, driver = "OpalDriver")
-    } else {
-      profile <- if (be == "armadillo_rserve") ARMA_RSERVE_PROFILE else ARMA_PROFILE
-      if (basic)
-        b$append(server = nm, url = ARMA_URL, user = ARMA_USER, password = ARMA_PASS,
-                 table = tbl, driver = "ArmadilloDriver", profile = profile)
-      else
-        b$append(server = nm, url = ARMA_URL, token = tok,
-                 table = tbl, driver = "ArmadilloDriver", profile = profile)
-    }
-  }
-  b$build()
-}

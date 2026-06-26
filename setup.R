@@ -101,16 +101,6 @@ cat(sprintf("Building %d benchmark tables from dsBaseClient data (%d rows)...\n"
             length(DATASETS), N_ROWS))
 tables <- build_tables(N_ROWS)
 
-# Discordant tables for ds.dataFrameFill: two CNSIM column subsets that share
-# LAB_TSC but each have one unique column, so the two studies disagree.
-local({
-  raw <- load_rda(DATASETS$cnsim$rda)
-  src <- raw[sample.int(nrow(raw), N_ROWS, replace = TRUE), , drop = FALSE]
-  src <- cbind(entity_id = seq_len(N_ROWS), key = seq_len(N_ROWS), src)
-  for (nm in names(DISC_COLS))
-    tables[[nm]] <<- src[, c("entity_id", "key", DISC_COLS[[nm]])]
-})
-
 for (nm in names(tables))
   cat(sprintf("  %-12s %d x %d\n", nm, nrow(tables[[nm]]), ncol(tables[[nm]])))
 

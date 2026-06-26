@@ -1,6 +1,11 @@
 results/
 *.csv
+.env
 secrets.env
+.Rlib/
+.Rlib_*/
 .Rproj.user/
 .Rhistory
 .RData
+.DS_Store
+Rplots.pdf

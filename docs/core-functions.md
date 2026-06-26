@@ -56,7 +56,7 @@ Not in the installed dsHelper (older/renamed or project-local): `dh.changeForm`,
 
 ## Primitive-testability
 
-The primitive test (COMPUTE mode) reads true server compute (`endDate − startDate`)
+The primitive test (`speed_true.R`) reads true server compute (`endDate − startDate`)
 for **a single server command**. So a function is directly testable only if it issues
 **exactly one** server command. Measured empirically by counting client-side
 `datashield.aggregate`/`assign.*` calls per function:
@@ -93,14 +93,20 @@ functions (`ds.histogram`, `ds.boxPlot`, `ds.scatterPlot`, `ds.heatmapPlot`,
 `ds.contourPlot`, `ds.forestplot`) — not needed for the two timing scenarios.
 
 ## Two benchmark scenarios
-1. **Primitives, true compute** — `COMPUTE=1 Rscript bench.R` times the
-   single-command subset via the server's own timestamps (→ `results/compute.csv`).
+1. **Primitives, true-vs-client speed** — `Rscript capture.R` extracts the
+   single-command primitives (→ `results/primitives.csv`); `Rscript speed_true.R`
+   times them via the server's own timestamps (→ `results/speed_true.csv`) and
+   `Rscript speed_client.R` times the same calls as the client observes them
+   (→ `results/speed_client.csv`).
 2. **Full function calls, low poll-sleep** — `POLL_SLEEP0=0.002 Rscript bench.R`
    runs the full core `ds.*`/`datashield.*` set as ops/sec with the DSI poll-sleep
    lowered so client-side waiting doesn't dominate (→ `results/rates.csv`).
 
-## Maximum testable primitive subset (in COMPUTE mode)
-All map to a single server command and a core function; wired into `compute_primitives` in `bench.R`:
+## Maximum testable primitive subset
+All map to a single server command and a core function. `capture.R` extracts them
+from the op registry into `results/primitives.csv` (aggregates + arithmetic
+assign), which `speed_true.R` / `speed_client.R` then time. The table-load
+primitive (`datashield.assign.table`) has a backend-specific table path, so it is
+measured by the broad survey (`bench.R`), not the speed scripts:
 - Aggregates: `dimDS` (ds.dim), `lengthDS` (ds.length), `classDS` (ds.class), `colnamesDS` (ds.colnames), `numNaDS` (ds.numNA), `quantileMeanDS` (ds.quantileMean)
 - Assign: `D$LAB_TSC * 2` (ds.assign/ds.make)
-- Table load: `datashield.assign.table`
